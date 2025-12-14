@@ -1,0 +1,127 @@
+import pandas as pd
+import numpy as np
+from sklearn.metrics.pairwise import haversine_distances
+
+# ==============================================================================
+# 1. 데이터 불러오기
+# ==============================================================================
+try:
+    station_df = pd.read_excel('역_최종.xlsx')
+    workplace_df = pd.read_excel('사업장_최종.xlsx')
+    print("파일 로딩 성공!")
+except FileNotFoundError:
+    print("오류: 파일을 찾을 수 없습니다. '역_최종.xlsx'와 '사업장_최종.xlsx'가 같은 폴더에 있는지 확인해주세요.")
+
+# ==============================================================================
+# 2. 데이터 전처리
+# ==============================================================================
+# A. 위경도 -> 라디안 변환 (거리 계산 필수)
+station_df['rad_lat'] = np.radians(station_df['위도'])
+station_df['rad_lon'] = np.radians(station_df['경도'])
+workplace_df['rad_lat'] = np.radians(workplace_df['위도'])
+workplace_df['rad_lon'] = np.radians(workplace_df['경도'])
+
+# B. 공급지(Origin) 역 추출: 승차 - 하차 > 0
+origin_stations = station_df[station_df['승하차인원'] > 0].copy()
+
+# ==============================================================================
+# 3. 교통 사각지대(Blind Spot) 회사 추출
+#    조건: 가장 가까운 역과의 거리가 5km 이상인 회사
+# ==============================================================================
+print("교통 사각지대(역 반경 5km 밖) 회사 추출 중...")
+
+# 전체 역 좌표 (인프라 기준)
+all_station_coords = station_df[['rad_lat', 'rad_lon']].to_numpy()
+# 전체 회사 좌표
+all_company_coords = workplace_df[['rad_lat', 'rad_lon']].to_numpy()
+
+# 모든 회사(Row) -> 모든 역(Col) 거리 계산
+dist_matrix_company_to_station = haversine_distances(all_company_coords, all_station_coords) * 6371
+
+# 각 회사별 최단 거리(min_dist) 계산
+min_dists = dist_matrix_company_to_station.min(axis=1)
+
+# 필터링: 최단 거리가 5km 이상인 인덱스
+blind_mask = min_dists >= 5.0
+target_companies = workplace_df[blind_mask].copy()
+
+print(f"전체 {len(workplace_df)}개 회사 중, 역세권(5km) 밖 회사는 {len(target_companies)}개 입니다.")
+
+if len(target_companies) == 0:
+    print("주의: 5km 반경 내에 역이 없는 회사가 하나도 없습니다! 기준을 완화하거나 데이터를 확인해주세요.")
+else:
+    # ==============================================================================
+    # 4. 중력 모형 적용 (Gravity Model)
+    #    Target Company(D) <-> Origin Station(O) 연결 및 점수 산출
+    # ==============================================================================
+    print("중력 모형 계산 중...")
+
+    # 좌표 준비
+    origin_coords = origin_stations[['rad_lat', 'rad_lon']].to_numpy()
+    target_coords = target_companies[['rad_lat', 'rad_lon']].to_numpy()
+
+    # 거리 행렬 계산 (Origin x Target)
+    dist_matrix_O_to_D = haversine_distances(origin_coords, target_coords) * 6371
+
+    # 공급(Supply): 역의 순승차인원
+    supply = origin_stations['승하차인원'].to_numpy().reshape(-1, 1)
+
+    # 유인(Attraction): 회사의 가입자수
+    attraction = target_companies['가입자수'].to_numpy().reshape(1, -1)
+
+    # 마찰 계수 (거리의 제곱에 반비례)
+    friction = 1 / ((dist_matrix_O_to_D + 0.001) ** 2)
+
+    # 중력 점수 = Supply * Attraction * Friction
+    gravity_scores = supply * attraction * friction
+
+    # ==============================================================================
+    # 5. Top 300 경로 추출 및 엑셀 저장
+    # ==============================================================================
+    print("상위 300개 경로 추출 중...")
+
+    # 상위 300개 인덱스 찾기
+    flat_indices = np.argsort(gravity_scores.ravel())[::-1][:300]
+    
+    # 2차원(row, col) 좌표로 변환
+    rows, cols = np.unravel_index(flat_indices, gravity_scores.shape)
+
+    # 데이터 프레임 생성
+    results = []
+    for r, c in zip(rows, cols):
+        # 역 정보 (Origin)
+        st_name = origin_stations.iloc[r]['역명']
+        st_line = origin_stations.iloc[r]['노선명'] # 주소 대신 노선명 사용
+        st_lat = origin_stations.iloc[r]['위도']
+        st_lon = origin_stations.iloc[r]['경도']
+        
+        # 회사 정보 (Target)
+        co_name = target_companies.iloc[c]['사업장명']
+        co_addr = target_companies.iloc[c]['Final_Address']
+        co_lat = target_companies.iloc[c]['위도']
+        co_lon = target_companies.iloc[c]['경도']
+        
+        # 수치 정보
+        score = gravity_scores[r, c]
+        dist = dist_matrix_O_to_D[r, c]
+        
+        results.append({
+            '역명': st_name,
+            '회사명': co_name,
+            '역_주소(노선)': st_line,
+            '회사_주소': co_addr,
+            '역_위도': st_lat,
+            '역_경도': st_lon,
+            '회사_위도': co_lat,
+            '회사_경도': co_lon,
+            '거리_km': round(dist, 2),
+            '중력값(점수)': int(score)
+        })
+
+    final_df = pd.DataFrame(results)
+
+    # 엑셀 저장
+    output_filename = 'BlindSpot_Analysis_Top300.xlsx'
+    final_df.to_excel(output_filename, index=False)
+    
+    print(f"\n[완료] 분석 결과가 '{output_filename}' 파일로 저장되었습니다.")
