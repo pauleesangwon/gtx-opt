@@ -1,0 +1,293 @@
+import pandas as pd
+import numpy as np
+import folium
+from folium.plugins import HeatMap
+from sklearn.metrics.pairwise import haversine_distances
+import webbrowser
+import os
+
+# ==============================================================================
+# 1. 데이터 로드 및 전처리
+# ==============================================================================
+print("데이터를 불러오는 중입니다...")
+try:
+    station_df = pd.read_excel('역_최종.xlsx')
+    workplace_df = pd.read_excel('사업장_최종.xlsx')
+except FileNotFoundError:
+    print("오류: 엑셀 파일을 찾을 수 없습니다.")
+    exit()
+
+# 위경도 -> 라디안 변환
+station_df['rad_lat'] = np.radians(station_df['위도'])
+station_df['rad_lon'] = np.radians(station_df['경도'])
+workplace_df['rad_lat'] = np.radians(workplace_df['위도'])
+workplace_df['rad_lon'] = np.radians(workplace_df['경도'])
+
+# 공급지(Origin) 설정: 순승차 인원이 있는 역
+origin_stations = station_df[station_df['승하차인원'] > 0].copy()
+
+# ==============================================================================
+# 2. 교통 사각지대(Blind Spot) 회사 추출
+# ==============================================================================
+print("1단계: 교통 사각지대(반경 5km 밖) 회사를 추출합니다...")
+
+all_st_coords = station_df[['rad_lat', 'rad_lon']].to_numpy()
+all_co_coords = workplace_df[['rad_lat', 'rad_lon']].to_numpy()
+
+# 모든 회사 -> 가장 가까운 역까지의 거리 계산
+dist_mat = haversine_distances(all_co_coords, all_st_coords) * 6371
+min_dists = dist_mat.min(axis=1)
+
+# 필터링: 5km 이상 떨어진 회사만 선택
+target_mask = min_dists >= 5.0
+target_companies = workplace_df[target_mask].copy()
+
+print(f" -> 전체 {len(workplace_df)}개 중 {len(target_companies)}개 회사가 분석 대상입니다.")
+
+# ==============================================================================
+# 3. 중력 모형 점수 계산 (Total Gravity Score)
+# ==============================================================================
+print("2단계: 중력 모형으로 잠재 수요 점수를 계산합니다...")
+
+origin_coords = origin_stations[['rad_lat', 'rad_lon']].to_numpy()
+target_coords = target_companies[['rad_lat', 'rad_lon']].to_numpy()
+
+# 거리 계산 (Origin x Target)
+dist_O_to_D = haversine_distances(origin_coords, target_coords) * 6371
+
+# 마찰 계수 (거리의 제곱에 반비례)
+friction = 1 / ((dist_O_to_D + 0.001) ** 2)
+
+# 공급(Supply) & 유인(Attraction)
+supply = origin_stations['승하차인원'].to_numpy().reshape(-1, 1)
+attraction = target_companies['가입자수'].to_numpy().reshape(1, -1)
+
+# Gravity Score 매트릭스 계산
+gravity_scores = supply * attraction * friction
+
+# 각 회사별 총점 합산 (모든 역에서의 유입 잠재력 총합)
+total_scores = gravity_scores.sum(axis=0)
+target_companies['total_gravity_score'] = total_scores
+
+# ==============================================================================
+# 4. 히트맵 시각화 (Folium)
+# ==============================================================================
+print("3단계: 지도를 그리는 중입니다...")
+
+# 지도의 중심: 타겟 회사들의 평균 위치
+center_lat = target_companies['위도'].mean()
+center_lon = target_companies['경도'].mean()
+
+# 지도 생성 (배경: 깔끔한 CartoDB Positron)
+m = folium.Map(location=[center_lat, center_lon], zoom_start=10, tiles='cartodbpositron')
+
+# --- [히트맵 설정] ---
+# 가중치 정규화 (0~1 사이 값으로 변환해야 색상이 예쁘게 나옴)
+max_score = target_companies['total_gravity_score'].max()
+target_companies['norm_score'] = target_companies['total_gravity_score'] / max_score
+
+# 데이터 준비: [위도, 경도, 가중치]
+heat_data = target_companies[['위도', '경도', 'norm_score']].values.tolist()
+
+# 히트맵 레이어 추가
+HeatMap(
+    heat_data,
+    min_opacity=0.3, # 최소 투명도 (0.1~1.0)
+    radius=20,       # 히트맵 점의 크기 (조절 포인트!)
+    blur=15,         # 번짐 효과 (조절 포인트!)
+    max_zoom=10,     # 최대 줌 레벨
+    gradient={0.2: 'blue', 0.4: 'lime', 0.6: 'yellow', 1.0: 'red'} # 색상 그라데이션
+).add_to(m)
+
+# --- [Top 50 핀(Marker) 추가] ---
+# 점수가 가장 높은 상위 50개 회사에 핀을 꽂아 확인하기 쉽게 함
+top_50 = target_companies.sort_values(by='total_gravity_score', ascending=False).head(50)
+
+for idx, row in top_50.iterrows():
+    # 팝업 내용 꾸미기 (HTML 태그 사용 가능)
+    popup_content = f"""
+    <div style="width:200px">
+        <h4>{row['사업장명']}</h4>
+        <b>주소:</b> {row['Final_Address']}<br>
+        <b>직원수:</b> {row['가입자수']:,}명<br>
+        <b>중력점수:</b> {int(row['total_gravity_score']):,}<br>
+        <hr>
+        <i>*교통사각지대 1순위 후보*</i>
+    </div>
+    """
+    
+    folium.CircleMarker(
+        location=[row['위도'], row['경도']],
+        radius=3,
+        color='red',
+        fill=True,
+        fill_color='red',
+        fill_opacity=0.7,
+        popup=folium.Popup(popup_content, max_width=300),
+        tooltip=f"{row['사업장명']} (Click!)"
+    ).add_to(m)
+
+# ==============================================================================
+# 5. 저장 및 실행
+# ==============================================================================
+output_file = 'BlindSpot_Heatmap.html'
+m.save(output_file)
+
+print(f"\n[성공] '{output_file}' 파일이 생성되었습니다.")
+print("웹 브라우저로 지도를 엽니다...")
+
+# 자동으로 브라우저 열기
+webbrowser.open('file://' + os.path.realpath(output_file))
+
+
+from folium.features import DivIcon
+
+# ==============================================================================
+# [추가] GTX A, B, C 노선 오버랩 (디자인 개선판)
+# ==============================================================================
+print("4단계: GTX 노선(Y자 분기) 및 뱃지를 추가합니다...")
+
+# 1. 데이터 정의 (좌표 포함)
+gtx_stations = {
+    'GTX-A': [
+        {'name': '운정', 'lat': 37.715, 'lon': 126.734},
+        {'name': '킨텍스', 'lat': 37.662, 'lon': 126.749},
+        {'name': '대곡', 'lat': 37.632, 'lon': 126.811},
+        {'name': '창릉', 'lat': 37.635, 'lon': 126.895},
+        {'name': '연신내', 'lat': 37.619, 'lon': 126.921},
+        {'name': '서울역', 'lat': 37.555, 'lon': 126.970},
+        {'name': '삼성', 'lat': 37.508, 'lon': 127.063},
+        {'name': '수서', 'lat': 37.487, 'lon': 127.101},
+        {'name': '성남', 'lat': 37.394, 'lon': 127.111},
+        {'name': '구성', 'lat': 37.289, 'lon': 127.107},
+        {'name': '동탄', 'lat': 37.199, 'lon': 127.096}
+    ],
+    'GTX-B': [
+        {'name': '인천대입구', 'lat': 37.386, 'lon': 126.639},
+        {'name': '인천시청', 'lat': 37.457, 'lon': 126.702},
+        {'name': '부평', 'lat': 37.489, 'lon': 126.724},
+        {'name': '부천종합운동장', 'lat': 37.502, 'lon': 126.797},
+        {'name': '신도림', 'lat': 37.508, 'lon': 126.891},
+        {'name': '여의도', 'lat': 37.521, 'lon': 126.924},
+        {'name': '용산', 'lat': 37.529, 'lon': 126.964},
+        {'name': '서울역', 'lat': 37.555, 'lon': 126.970},
+        {'name': '청량리', 'lat': 37.580, 'lon': 127.048},
+        {'name': '상봉', 'lat': 37.596, 'lon': 127.085},
+        {'name': '별내', 'lat': 37.642, 'lon': 127.126},
+        {'name': '왕숙', 'lat': 37.665, 'lon': 127.165},
+        {'name': '평내호평', 'lat': 37.653, 'lon': 127.244},
+        {'name': '마석', 'lat': 37.652, 'lon': 127.302}
+    ],
+    'GTX-C': [
+        {'name': '덕정', 'lat': 37.843, 'lon': 127.061},
+        {'name': '의정부', 'lat': 37.738, 'lon': 127.046},
+        {'name': '창동', 'lat': 37.653, 'lon': 127.047},
+        {'name': '광운대', 'lat': 37.623, 'lon': 127.061},
+        {'name': '청량리', 'lat': 37.580, 'lon': 127.048},
+        {'name': '왕십리', 'lat': 37.561, 'lon': 127.037},
+        {'name': '삼성', 'lat': 37.508, 'lon': 127.063},
+        {'name': '양재', 'lat': 37.484, 'lon': 127.034},
+        {'name': '정부과천청사', 'lat': 37.426, 'lon': 126.989},
+        {'name': '인덕원', 'lat': 37.401, 'lon': 126.976},
+        {'name': '금정', 'lat': 37.372, 'lon': 126.943},
+        {'name': '의왕', 'lat': 37.320, 'lon': 126.948},
+        {'name': '수원', 'lat': 37.265, 'lon': 126.999},
+        {'name': '상록수', 'lat': 37.302, 'lon': 126.865}
+    ]
+}
+
+colors = {'GTX-A': 'purple', 'GTX-B': 'blue', 'GTX-C': 'green'}
+short_names = {'GTX-A': 'A', 'GTX-B': 'B', 'GTX-C': 'C'}
+
+# --- 뱃지 생성 함수 (알파벳 아이콘) ---
+def get_badge_html(letter, color):
+    return f"""
+    <div style="
+        background-color: {color};
+        color: white;
+        border-radius: 50%;
+        width: 24px;
+        height: 24px;
+        text-align: center;
+        line-height: 24px;
+        font-weight: bold;
+        font-size: 14px;
+        box-shadow: 2px 2px 3px rgba(0,0,0,0.3);
+        font-family: Arial, sans-serif;">
+        {letter}
+    </div>
+    """
+
+# 2. 노선 그리기 로직
+for line_name, stations in gtx_stations.items():
+    color = colors[line_name]
+    badge_char = short_names[line_name]
+    
+    # 뱃지를 달 역 이름 지정 (운정, 마석, 덕정)
+    badge_stations = []
+    if line_name == 'GTX-A': badge_stations = ['운정']
+    elif line_name == 'GTX-B': badge_stations = ['마석']
+    elif line_name == 'GTX-C': badge_stations = ['덕정']
+
+    # --- [Line Drawing] 선 그리기 ---
+    coords = [[s['lat'], s['lon']] for s in stations]
+    
+    # GTX-C는 Y자 분기를 위해 선을 쪼개서 그림
+    if line_name == 'GTX-C':
+        # 1. 공통 구간: 덕정(0) ~ 의왕(11)
+        # 인덱스 찾기: 덕정=0, 의왕=11, 수원=12, 상록수=13 (위 리스트 순서 기준)
+        # 안전하게 이름으로 인덱스 찾기
+        idx_uiwang = next(i for i, s in enumerate(stations) if s['name'] == '의왕')
+        idx_suwon = next(i for i, s in enumerate(stations) if s['name'] == '수원')
+        idx_sangnoksu = next(i for i, s in enumerate(stations) if s['name'] == '상록수')
+
+        # 메인 라인 (덕정~의왕)
+        main_line = coords[:idx_uiwang+1]
+        folium.PolyLine(main_line, color=color, weight=4, opacity=0.7).add_to(m)
+
+        # 분기 1 (의왕~수원)
+        branch1 = [coords[idx_uiwang], coords[idx_suwon]]
+        folium.PolyLine(branch1, color=color, weight=4, opacity=0.7).add_to(m)
+
+        # 분기 2 (의왕~상록수)
+        branch2 = [coords[idx_uiwang], coords[idx_sangnoksu]]
+        folium.PolyLine(branch2, color=color, weight=4, opacity=0.7).add_to(m)
+        
+    else:
+        # A, B 노선은 그냥 일자로 연결
+        folium.PolyLine(coords, color=color, weight=4, opacity=0.7).add_to(m)
+
+    # --- [Marker Drawing] 점 및 뱃지 찍기 ---
+    for st in stations:
+        if st['name'] in badge_stations:
+            # 알파벳 뱃지 아이콘
+            folium.Marker(
+                location=[st['lat'], st['lon']],
+                icon=DivIcon(html=get_badge_html(badge_char, color), icon_size=(24, 24), icon_anchor=(12, 12)),
+                tooltip=f"{line_name} {st['name']}역 (종점)"
+            ).add_to(m)
+        else:
+            # 일반 역 (심플한 점)
+            folium.CircleMarker(
+                location=[st['lat'], st['lon']],
+                radius=4,            # 점 크기 (작게)
+                color=color,         # 테두리 색
+                fill=True,
+                fill_color='white',  # 내부 색 (흰색으로 채워서 깔끔하게)
+                fill_opacity=1.0,
+                opacity=1.0,
+                tooltip=f"{line_name} {st['name']}역"
+            ).add_to(m)
+
+# 레이어 컨트롤 추가
+folium.LayerControl().add_to(m)
+
+# ==============================================================================
+# 5. 저장 및 실행
+# ==============================================================================
+output_file = 'BlindSpot_Heatmap_GTX_Design.html'
+m.save(output_file)
+
+print(f"\n[성공] 디자인이 개선된 지도 '{output_file}' 가 생성되었습니다.")
+webbrowser.open('file://' + os.path.realpath(output_file))
+
