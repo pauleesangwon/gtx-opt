@@ -1,0 +1,428 @@
+"""
+GTX 역세권 분석 데이터 파이프라인
+================================
+입력: 4개 파일
+  1. 국민연금공단_국민연금 가입 사업장 내역_*.csv
+  2. (2025년10월) 광역철도 시간대별 승하차인원(홈페이지).xlsx
+  3. 서울교통공사_역별 일별 시간대별 승하차인원 정보_*.csv
+  4. 서울교통공사_9호선2_3단계 역별일별시간대별승하차인원_*.csv
+
+출력: 2개 파일
+  1. 사업장_최종.xlsx (사업장명, Final_Address, 가입자수, 위도, 경도)
+  2. 역_최종.xlsx (역명, 노선명, 승하차인원, 위도, 경도)
+"""
+
+import os
+import re
+import time
+import warnings
+import numpy as np
+import pandas as pd
+import requests
+from pathlib import Path
+from typing import Optional, Tuple
+
+warnings.filterwarnings('ignore')
+
+# ============================================================
+# 설정 (여기만 수정하세요!)
+# ============================================================
+class Config:
+    # 폴더 경로
+    INPUT_DIR = Path(r"C:\Raw")
+    OUTPUT_DIR = Path(r"C:\Raw")  # 출력도 같은 폴더
+    
+    # 입력 파일명 (부분 일치로 검색)
+    FILE_BUSINESS = "국민연금공단_국민연금 가입 사업장 내역"
+    FILE_KORAIL = "광역철도 시간대별 승하차인원"
+    FILE_SEOUL_METRO = "서울교통공사_역별 일별 시간대별 승하차인원"
+    FILE_LINE9 = "서울교통공사_9호선"
+    
+    # 카카오 API 키
+    KAKAO_API_KEY = "facde6303ce5322df7a8e71b7853362f"
+    
+    # 처리 옵션
+    MIN_EMPLOYEES = 50  # 최소 가입자 수
+    TARGET_REGIONS = ['서울', '경기', '인천']  # 대상 지역
+
+
+# ============================================================
+# 유틸리티 함수
+# ============================================================
+def find_file(directory: Path, keyword: str) -> Optional[Path]:
+    """키워드로 파일 찾기"""
+    for f in directory.iterdir():
+        if keyword in f.name and f.is_file():
+            return f
+    return None
+
+
+def read_csv_auto(filepath: Path, **kwargs) -> pd.DataFrame:
+    """인코딩 자동 감지하여 CSV 읽기"""
+    encodings = ['utf-8', 'cp949', 'euc-kr', 'utf-8-sig']
+    for enc in encodings:
+        try:
+            return pd.read_csv(filepath, encoding=enc, **kwargs)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    raise ValueError(f"파일 인코딩을 감지할 수 없습니다: {filepath}")
+
+
+def get_coordinates_kakao(query: str, api_key: str, is_station: bool = False) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """
+    카카오 API로 좌표 변환
+    Returns: (위도, 경도, 주소) 또는 (None, None, 에러코드)
+    """
+    if is_station:
+        url = 'https://dapi.kakao.com/v2/local/search/keyword.json'
+        search_query = query if query.endswith('역') else query + '역'
+        params = {'query': search_query}
+    else:
+        url = 'https://dapi.kakao.com/v2/local/search/address.json'
+        params = {'query': query}
+    
+    headers = {"Authorization": f"KakaoAK {api_key}"}
+    
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            documents = data.get('documents', [])
+            
+            if documents:
+                doc = documents[0]
+                lat = float(doc['y'])
+                lng = float(doc['x'])
+                address = doc.get('address_name', doc.get('road_address_name', ''))
+                return lat, lng, address
+            return None, None, "NO_RESULT"
+        return None, None, f"HTTP_{response.status_code}"
+    except requests.exceptions.Timeout:
+        return None, None, "TIMEOUT"
+    except Exception as e:
+        return None, None, f"ERROR: {str(e)}"
+
+
+def classify_region(address: str) -> Optional[str]:
+    """주소에서 지역 분류"""
+    if not address or pd.isna(address) or str(address).strip() == '':
+        return None
+    first_word = str(address).split()[0]
+    if '서울' in first_word:
+        return '서울'
+    elif '경기' in first_word:
+        return '경기'
+    elif '인천' in first_word:
+        return '인천'
+    return None
+
+
+def clean_station_name(name: str) -> Optional[str]:
+    """역명 정제"""
+    if pd.isna(name):
+        return None
+    s = str(name).strip()
+    if s == '' or s.lower() == 'nan':
+        return None
+    s = re.sub(r'\s+', ' ', s).strip()
+    if re.match(r'^서울(\(|$)', s):
+        return '서울역'
+    s = re.sub(r'\([^)]*\)', '', s)
+    s = s.replace('(', '').replace(')', '')
+    s = s.replace('.', '').replace('·', '').replace('ㆍ', '')
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s if s else None
+
+
+def normalize_line_name(x) -> Optional[str]:
+    """노선명 표준화"""
+    if pd.isna(x):
+        return None
+    t = str(x).strip()
+    if t == '':
+        return None
+    if re.fullmatch(r'\d+', t):
+        return f'{t}호선'
+    return t
+
+
+# ============================================================
+# 파이프라인 A: 사업장 데이터 처리
+# ============================================================
+def process_business_data(config: Config) -> pd.DataFrame:
+    """
+    사업장 데이터 처리
+    출력: 사업장명, Final_Address, 가입자수, 위도, 경도
+    """
+    print("\n" + "="*60)
+    print("📊 파이프라인 A: 사업장 데이터 처리")
+    print("="*60)
+    
+    filepath = find_file(config.INPUT_DIR, config.FILE_BUSINESS)
+    if not filepath:
+        raise FileNotFoundError(f"사업장 파일을 찾을 수 없습니다: {config.FILE_BUSINESS}")
+    
+    print(f"✓ 파일: {filepath.name}")
+    
+    # Step 1: 열 추출 (B=1, F=5, G=6, S=18)
+    df = read_csv_auto(filepath, usecols=[1, 5, 6, 18])
+    df.columns = ['사업장명', '지번주소', '도로명주소', '가입자수']
+    print(f"  - 원본: {len(df):,}개")
+    
+    # Step 2: 50인 이상 필터
+    df['가입자수'] = pd.to_numeric(df['가입자수'], errors='coerce').fillna(0).astype(int)
+    df = df[df['가입자수'] >= config.MIN_EMPLOYEES].copy()
+    print(f"  - {config.MIN_EMPLOYEES}인 이상: {len(df):,}개")
+    
+    # Step 3: Final_Address (도로명 우선)
+    df['Final_Address'] = df['도로명주소'].fillna(df['지번주소']).astype(str)
+    
+    # Step 4: 수도권만
+    df['지역'] = df['Final_Address'].apply(classify_region)
+    df = df[df['지역'].notna()].copy()
+    print(f"  - 수도권: {len(df):,}개")
+    
+    # Step 5: 좌표 변환
+    print(f"\n📍 좌표 변환 중... ({len(df):,}개)")
+    
+    lats, lngs = [], []
+    for idx, (i, row) in enumerate(df.iterrows()):
+        if idx % 500 == 0 and idx > 0:
+            print(f"  [{idx:,}/{len(df):,}] 처리 중...")
+        
+        lat, lng, _ = get_coordinates_kakao(row['Final_Address'], config.KAKAO_API_KEY)
+        lats.append(lat)
+        lngs.append(lng)
+        
+        if idx % 100 == 0:
+            time.sleep(0.05)
+    
+    df['위도'] = lats
+    df['경도'] = lngs
+    
+    # 좌표 있는 것만
+    df = df[df['위도'].notna() & df['경도'].notna()].copy()
+    
+    # 최종 출력 형식
+    result = df[['사업장명', 'Final_Address', '가입자수', '위도', '경도']].copy()
+    result = result.sort_values('가입자수', ascending=False).reset_index(drop=True)
+    
+    print(f"✓ 완료: {len(result):,}개 사업장")
+    return result
+
+
+# ============================================================
+# 파이프라인 B: 역 데이터 처리
+# ============================================================
+def process_korail_data(filepath: Path) -> pd.DataFrame:
+    """광역철도 데이터"""
+    print(f"\n  [B-1] 광역철도: {filepath.name}")
+    
+    xls = pd.ExcelFile(filepath)
+    last_sheet = xls.sheet_names[-1]
+    raw = pd.read_excel(filepath, sheet_name=last_sheet, header=None)
+    
+    mask = raw[0].astype(str).str.strip().eq('2) 역별')
+    if not mask.any():
+        raise ValueError("'2) 역별' 섹션을 찾을 수 없습니다")
+    
+    start_idx = mask.idxmax()
+    df = pd.read_excel(filepath, sheet_name=last_sheet, skiprows=start_idx + 1)
+    df = df[df['역명'].notna()].copy()
+    
+    time_cols = ['06시 이전', '07시', '08시', '09시']
+    for col in time_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    
+    df['sum_06_09'] = df[[c for c in time_cols if c in df.columns]].sum(axis=1)
+    df['구분'] = df['구분'].astype(str).str.strip()
+    
+    pt = df.pivot_table(
+        index=['역명', '노선명'], columns='구분',
+        values='sum_06_09', aggfunc='sum', fill_value=0
+    ).reset_index()
+    
+    pt['승하차인원'] = pt.get('승차', 0) - pt.get('하차', 0)
+    result = pt[['역명', '노선명', '승하차인원']].copy()
+    print(f"    → {len(result)}개 역")
+    return result
+
+
+def process_seoul_metro_data(filepath: Path) -> pd.DataFrame:
+    """서울교통공사 데이터"""
+    print(f"\n  [B-2] 서울교통공사: {filepath.name}")
+    
+    df = read_csv_auto(filepath)
+    col_line, col_station, col_type = df.columns[2], df.columns[4], df.columns[5]
+    time_cols = df.columns[6:10]
+    
+    for col in time_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    
+    df['Time_Sum'] = df[time_cols].sum(axis=1)
+    df['Multiplier'] = df[col_type].apply(lambda x: 1 if '승차' in str(x) else (-1 if '하차' in str(x) else 0))
+    df['Final_Value'] = df['Time_Sum'] * df['Multiplier']
+    
+    result = df.groupby([col_station, col_line])['Final_Value'].sum().reset_index()
+    result.columns = ['역명', '노선명', '승하차인원']
+    print(f"    → {len(result)}개 역")
+    return result
+
+
+def process_line9_data(filepath: Path) -> pd.DataFrame:
+    """9호선 데이터"""
+    print(f"\n  [B-3] 9호선: {filepath.name}")
+    
+    df = read_csv_auto(filepath)
+    col_line, col_station, col_type = df.columns[2], df.columns[4], df.columns[5]
+    time_cols = df.columns[11:15]
+    
+    for col in time_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    
+    df['Multiplier'] = df[col_type].apply(lambda x: 1 if '승차' in str(x) else (-1 if '하차' in str(x) else 0))
+    df['Value'] = df[time_cols].sum(axis=1) * df['Multiplier']
+    
+    result = df.groupby([col_station, col_line])['Value'].sum().reset_index()
+    result.columns = ['역명', '노선명', '승하차인원']
+    result['노선명'] = result['노선명'].apply(normalize_line_name)
+    print(f"    → {len(result)}개 역")
+    return result
+
+
+def process_station_data(config: Config) -> pd.DataFrame:
+    """
+    역 데이터 처리
+    출력: 역명, 노선명, 승하차인원, 위도, 경도
+    """
+    print("\n" + "="*60)
+    print("🚉 파이프라인 B: 역 데이터 처리")
+    print("="*60)
+    
+    dfs = []
+    
+    # 3개 파일 처리
+    for keyword, processor in [
+        (config.FILE_KORAIL, process_korail_data),
+        (config.FILE_SEOUL_METRO, process_seoul_metro_data),
+        (config.FILE_LINE9, process_line9_data),
+    ]:
+        filepath = find_file(config.INPUT_DIR, keyword)
+        if filepath:
+            dfs.append(processor(filepath))
+        else:
+            print(f"  ⚠ 파일 없음: {keyword}")
+    
+    if not dfs:
+        raise ValueError("처리할 역 데이터가 없습니다")
+    
+    # 통합
+    print(f"\n  [B-4] 통합")
+    merged = pd.concat(dfs, ignore_index=True)
+    merged['역명'] = merged['역명'].apply(clean_station_name)
+    merged['노선명'] = merged['노선명'].apply(normalize_line_name)
+    merged = merged.dropna(subset=['역명', '노선명', '승하차인원'])
+    
+    gold = merged.groupby(['역명', '노선명'], as_index=False)['승하차인원'].sum()
+    print(f"    → {len(gold)}개 행")
+    
+    # 역 단위 압축
+    print(f"\n  [B-5] 역 단위 압축")
+    
+    def line_sort_key(s):
+        m = re.fullmatch(r'(\d+)호선', s)
+        return (0, int(m.group(1)), '') if m else (1, 10**9, s)
+    
+    def join_lines(series):
+        lines = [x for x in series.dropna().astype(str).map(str.strip).tolist() if x and x.lower() != 'nan']
+        return ', '.join(sorted(set(lines), key=line_sort_key))
+    
+    platinum = gold.groupby('역명', as_index=False).agg(
+        노선명=('노선명', join_lines),
+        승하차인원=('승하차인원', 'sum')
+    )
+    print(f"    → {len(platinum)}개 역")
+    
+    # 좌표 변환
+    print(f"\n📍 좌표 변환 중... ({len(platinum)}개)")
+    
+    lats, lngs = [], []
+    valid_indices = []
+    
+    for idx, row in platinum.iterrows():
+        station = row['역명']
+        lat, lng, address = get_coordinates_kakao(station, config.KAKAO_API_KEY, is_station=True)
+        
+        if lat and lng:
+            region = classify_region(address)
+            if region in config.TARGET_REGIONS:
+                lats.append(lat)
+                lngs.append(lng)
+                valid_indices.append(idx)
+            else:
+                print(f"    제외(타지역): {station}")
+        else:
+            print(f"    검색실패: {station}")
+        
+        if idx % 50 == 0:
+            time.sleep(0.05)
+    
+    result = platinum.loc[valid_indices].copy()
+    result['위도'] = lats
+    result['경도'] = lngs
+    
+    # 최종 출력 형식
+    result = result[['역명', '노선명', '승하차인원', '위도', '경도']]
+    result = result.sort_values('승하차인원', ascending=False).reset_index(drop=True)
+    
+    print(f"✓ 완료: {len(result)}개 역")
+    return result
+
+
+# ============================================================
+# 메인 실행
+# ============================================================
+def main():
+    print("\n" + "="*60)
+    print("🚀 GTX 역세권 분석 데이터 파이프라인")
+    print("="*60)
+    
+    config = Config()
+    config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\n📁 입력: {config.INPUT_DIR}")
+    print(f"📁 출력: {config.OUTPUT_DIR}")
+    
+    results = {}
+    
+    # 파이프라인 A: 사업장
+    try:
+        df_business = process_business_data(config)
+        output_path = config.OUTPUT_DIR / "사업장_최종.xlsx"
+        df_business.to_excel(output_path, index=False)
+        results['사업장'] = (len(df_business), output_path)
+        print(f"\n💾 저장: {output_path}")
+    except FileNotFoundError as e:
+        print(f"\n⚠ 사업장 스킵: {e}")
+    
+    # 파이프라인 B: 역
+    try:
+        df_station = process_station_data(config)
+        output_path = config.OUTPUT_DIR / "역_최종.xlsx"
+        df_station.to_excel(output_path, index=False)
+        results['역'] = (len(df_station), output_path)
+        print(f"\n💾 저장: {output_path}")
+    except FileNotFoundError as e:
+        print(f"\n⚠ 역 스킵: {e}")
+    
+    # 완료
+    print("\n" + "="*60)
+    print("✅ 완료! 출력 파일 2개:")
+    print("="*60)
+    for name, (count, path) in results.items():
+        print(f"  📄 {path.name}: {count:,}개 {name}")
+
+
+if __name__ == "__main__":
+    main()
